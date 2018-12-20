@@ -1,7 +1,7 @@
 %{?cygwin_package_header}
 
 Name:           cygwin-libbfd
-Version:        2.29.1
+Version:        2.31.1
 Release:        1%{?dist}
 Summary:        Cygwin BFD and opcodes libraries
 
@@ -12,6 +12,7 @@ BuildArch:      noarch
 
 Source0:        http://ftpmirror.gnu.org/binutils/binutils-%{version}.tar.xz
 
+BuildRequires:  gcc
 BuildRequires:  flex
 BuildRequires:  bison
 BuildRequires:  texinfo
@@ -112,6 +113,9 @@ find $RPM_BUILD_ROOT -name '*.la' -delete
 
 
 %changelog
+* Thu Dec 20 2018 Yaakov Selkowitz <yselkowi@redhat.com> - 2.31.1-1
+- new version
+
 * Tue Dec 05 2017 Yaakov Selkowitz <yselkowi@redhat.com> - 2.29.1-1
 - new version
 
