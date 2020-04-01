@@ -1,7 +1,7 @@
 %{?cygwin_package_header}
 
 Name:           cygwin-libbfd
-Version:        2.31.1
+Version:        2.34
 Release:        1%{?dist}
 Summary:        Cygwin BFD and opcodes libraries
 
@@ -11,6 +11,8 @@ URL:            http://www.gnu.org/software/binutils/
 BuildArch:      noarch
 
 Source0:        http://ftpmirror.gnu.org/binutils/binutils-%{version}.tar.xz
+Patch1:         0001-PR25447.patch
+Patch2:         0002-PR24511.patch
 
 BuildRequires:  gcc
 BuildRequires:  flex
@@ -61,7 +63,7 @@ unstable to be used dynamically.
 
 
 %prep
-%setup -q -n binutils-%{version}
+%autosetup -n binutils-%{version} -p1
 
 
 %build
