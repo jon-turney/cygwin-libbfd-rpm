@@ -93,6 +93,7 @@ find $RPM_BUILD_ROOT -name '*.la' -delete
 %{cygwin32_includedir}/ansidecl.h
 %{cygwin32_includedir}/bfd.h
 %{cygwin32_includedir}/bfdlink.h
+%{cygwin32_includedir}/bfd_stdint.h
 %{cygwin32_includedir}/diagnostics.h
 %{cygwin32_includedir}/dis-asm.h
 %{cygwin32_includedir}/plugin-api.h
@@ -106,6 +107,7 @@ find $RPM_BUILD_ROOT -name '*.la' -delete
 %{cygwin64_includedir}/ansidecl.h
 %{cygwin64_includedir}/bfd.h
 %{cygwin64_includedir}/bfdlink.h
+%{cygwin64_includedir}/bfd_stdint.h
 %{cygwin64_includedir}/diagnostics.h
 %{cygwin64_includedir}/dis-asm.h
 %{cygwin64_includedir}/plugin-api.h
