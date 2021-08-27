@@ -74,11 +74,11 @@ unstable to be used dynamically.
   --disable-win32-registry \
   --disable-werror
 
-%cygwin_make %{?_smp_flags} all-libiberty all-opcodes all-bfd
+%cygwin_make %{?_smp_flags} all-libiberty all-opcodes all-bfd all-libctf
 
 
 %install
-%cygwin_make DESTDIR=$RPM_BUILD_ROOT install-libiberty install-opcodes install-bfd
+%cygwin_make DESTDIR=$RPM_BUILD_ROOT install-libiberty install-opcodes install-bfd install-libctf
 
 # These files conflict with ordinary binutils.
 rm -rf $RPM_BUILD_ROOT%{cygwin32_infodir}
