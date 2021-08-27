@@ -1,7 +1,7 @@
 %{?cygwin_package_header}
 
 Name:           cygwin-libbfd
-Version:        2.34
+Version:        2.37
 Release:        1%{?dist}
 Summary:        Cygwin BFD and opcodes libraries
 
@@ -10,9 +10,9 @@ Group:          Development/Libraries
 URL:            http://www.gnu.org/software/binutils/
 BuildArch:      noarch
 
-Source0:        http://ftpmirror.gnu.org/binutils/binutils-%{version}.tar.xz
-Patch1:         0001-PR25447.patch
-Patch2:         0002-PR24511.patch
+Source0:        https://ftpmirror.gnu.org/binutils/binutils-%{version}.tar.xz
+Patch1:         binutils-2.37-cygwin-config-rpath.patch
+Patch2:         binutils-2.37-cygwin-peflags.patch
 
 BuildRequires:  gcc
 BuildRequires:  flex
@@ -68,6 +68,7 @@ unstable to be used dynamically.
 
 %build
 %cygwin_configure \
+  --enable-64-bit-bfd \
   --without-included-gettext \
   --enable-install-libiberty \
   --disable-win32-registry \
@@ -119,6 +120,12 @@ find $RPM_BUILD_ROOT -name '*.la' -delete
 
 
 %changelog
+* Thu Aug 26 2021 Yaakov Selkowitz <yselkowi@redhat.com> - 2.37-1
+- new version
+
+* Wed Apr  1 2020 Yaakov Selkowitz <yselkowi@redhat.com> - 2.34-1
+- new version
+
 * Thu Dec 20 2018 Yaakov Selkowitz <yselkowi@redhat.com> - 2.31.1-1
 - new version
 
