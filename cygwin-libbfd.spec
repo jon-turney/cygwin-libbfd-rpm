@@ -1,7 +1,7 @@
 %{?cygwin_package_header}
 
 Name:           cygwin-libbfd
-Version:        2.37
+Version:        2.39
 Release:        1%{?dist}
 Summary:        Cygwin BFD and opcodes libraries
 
@@ -12,7 +12,6 @@ BuildArch:      noarch
 
 Source0:        https://ftpmirror.gnu.org/binutils/binutils-%{version}.tar.xz
 Patch1:         binutils-2.37-cygwin-config-rpath.patch
-Patch2:         binutils-2.37-cygwin-peflags.patch
 
 BuildRequires:  gcc
 BuildRequires:  flex
