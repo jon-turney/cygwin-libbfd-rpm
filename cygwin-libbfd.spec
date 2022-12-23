@@ -115,7 +115,7 @@ find $RPM_BUILD_ROOT -name '*.la' -delete
 - Adapt to new Cygwin packaging scheme.
 - Add cygwin64 package.
 
-* Sun Mar 09 2013 Yaakov Selkowitz <yselkowitz@users.sourceforge.net> - 2.23.51-1
+* Sun Mar 10 2013 Yaakov Selkowitz <yselkowitz@users.sourceforge.net> - 2.23.51-1
 - Version bump.
 
 * Thu Jan 24 2013 Yaakov Selkowitz <yselkowitz@users.sourceforge.net> - 2.22.51-2
