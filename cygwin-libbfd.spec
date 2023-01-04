@@ -1,10 +1,8 @@
 %{?cygwin_package_header}
 
-%undefine cygwin_build_32bit 
-
 Name:           cygwin-libbfd
 Version:        2.39
-Release:        2%{?dist}
+Release:        3%{?dist}
 Summary:        Cygwin BFD and opcodes libraries
 
 License:        GPLv2+ and LGPLv2+ and GPLv3+ and LGPLv3+
@@ -20,6 +18,12 @@ BuildRequires:  flex
 BuildRequires:  bison
 BuildRequires:  texinfo
 
+BuildRequires:  cygwin32-filesystem
+BuildRequires:  cygwin32-gcc
+BuildRequires:  cygwin32
+BuildRequires:  cygwin32-gettext
+BuildRequires:  cygwin32-zlib
+
 BuildRequires:  cygwin64-filesystem
 BuildRequires:  cygwin64-gcc
 BuildRequires:  cygwin64
@@ -29,6 +33,19 @@ BuildRequires:  cygwin64-zlib
 %description
 This package contains Cygwin cross-compiled BFD and opcodes static
 libraries.
+
+%package -n cygwin32-libbfd
+Summary:        Cygwin32 BFD and opcodes libraries
+Group:          Development/Libraries
+Requires:       cygwin32-filesystem
+Requires:       cygwin32
+Requires:       cygwin32-gettext-static
+Requires:       cygwin32-zlib-static
+
+%description -n cygwin32-libbfd
+This package contains Cygwin i686 cross-compiled BFD and opcodes static
+libraries. Only static libraries are provided because the API is too
+unstable to be used dynamically.
 
 %package -n cygwin64-libbfd
 Summary:        Cygwin64 BFD and opcodes libraries
@@ -63,12 +80,31 @@ unstable to be used dynamically.
 %cygwin_make DESTDIR=$RPM_BUILD_ROOT install-libiberty install-opcodes install-bfd install-libctf
 
 # These files conflict with ordinary binutils.
+rm -rf $RPM_BUILD_ROOT%{cygwin32_infodir}
+rm -rf $RPM_BUILD_ROOT%{cygwin32_datadir}/locale/
 rm -rf $RPM_BUILD_ROOT%{cygwin64_infodir}
 rm -rf $RPM_BUILD_ROOT%{cygwin64_datadir}/locale/
 
 # Do not ship .la files
 find $RPM_BUILD_ROOT -name '*.la' -delete
 
+
+%files -n cygwin32-libbfd
+%{cygwin32_includedir}/ansidecl.h
+%{cygwin32_includedir}/bfd.h
+%{cygwin32_includedir}/bfdlink.h
+%{cygwin32_includedir}/ctf.h
+%{cygwin32_includedir}/ctf-api.h
+%{cygwin32_includedir}/diagnostics.h
+%{cygwin32_includedir}/dis-asm.h
+%{cygwin32_includedir}/plugin-api.h
+%{cygwin32_includedir}/symcat.h
+%{cygwin32_includedir}/libiberty/
+%{cygwin32_libdir}/libbfd.a
+%{cygwin32_libdir}/libctf.a
+%{cygwin32_libdir}/libctf-nobfd.a
+%{cygwin32_libdir}/libiberty.a
+%{cygwin32_libdir}/libopcodes.a
 
 %files -n cygwin64-libbfd
 %{cygwin64_includedir}/ansidecl.h
@@ -89,12 +125,6 @@ find $RPM_BUILD_ROOT -name '*.la' -delete
 
 
 %changelog
-* Fri Dec 23 2022 Corinna Vinschen <vinschen@redhat.com> - 2.39-2
-- drop 32 bit support
-
-* Thu Dec 22 2022 Corinna Vinschen <vinschen@redhat.com> - 2.39-1
-- new version
-
 * Thu Aug 26 2021 Yaakov Selkowitz <yselkowi@redhat.com> - 2.37-1
 - new version
 
@@ -115,7 +145,7 @@ find $RPM_BUILD_ROOT -name '*.la' -delete
 - Adapt to new Cygwin packaging scheme.
 - Add cygwin64 package.
 
-* Sun Mar 10 2013 Yaakov Selkowitz <yselkowitz@users.sourceforge.net> - 2.23.51-1
+* Sun Mar 09 2013 Yaakov Selkowitz <yselkowitz@users.sourceforge.net> - 2.23.51-1
 - Version bump.
 
 * Thu Jan 24 2013 Yaakov Selkowitz <yselkowitz@users.sourceforge.net> - 2.22.51-2
