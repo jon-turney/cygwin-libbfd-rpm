@@ -1,8 +1,8 @@
 %{?cygwin_package_header}
 
 Name:           cygwin-libbfd
-Version:        2.39
-Release:        3%{?dist}
+Version:        2.42
+Release:        1%{?dist}
 Summary:        Cygwin BFD and opcodes libraries
 
 License:        GPLv2+ and LGPLv2+ and GPLv3+ and LGPLv3+
@@ -11,7 +11,8 @@ URL:            http://www.gnu.org/software/binutils/
 BuildArch:      noarch
 
 Source0:        https://ftpmirror.gnu.org/binutils/binutils-%{version}.tar.xz
-Patch1:         binutils-2.37-cygwin-config-rpath.patch
+Patch1:		binutils-2.42-cygwin-config-rpath.patch
+#Patch2:	binutils-2.42-cygwin-pep-dll-double-definition.patch
 
 BuildRequires:  gcc
 BuildRequires:  flex
@@ -105,6 +106,9 @@ find $RPM_BUILD_ROOT -name '*.la' -delete
 %{cygwin32_libdir}/libctf-nobfd.a
 %{cygwin32_libdir}/libiberty.a
 %{cygwin32_libdir}/libopcodes.a
+%{cygwin32_includedir}/sframe-api.h
+%{cygwin32_includedir}/sframe.h
+%{cygwin32_libdir}/libsframe.a
 
 %files -n cygwin64-libbfd
 %{cygwin64_includedir}/ansidecl.h
@@ -122,6 +126,9 @@ find $RPM_BUILD_ROOT -name '*.la' -delete
 %{cygwin64_libdir}/libctf-nobfd.a
 %{cygwin64_libdir}/libiberty.a
 %{cygwin64_libdir}/libopcodes.a
+%{cygwin64_includedir}/sframe-api.h
+%{cygwin64_includedir}/sframe.h
+%{cygwin64_libdir}/libsframe.a
 
 
 %changelog
