@@ -4,7 +4,7 @@
 
 Name:           cygwin-libbfd
 Version:        2.47
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        Cygwin BFD and opcodes libraries
 
 License:        GPLv2+ and LGPLv2+ and GPLv3+ and LGPLv3+
@@ -13,7 +13,17 @@ URL:            https://www.gnu.org/software/binutils/
 BuildArch:      noarch
 
 Source0:        https://ftp.gnu.org/gnu/binutils/binutils-%{version}.tar.xz
-Patch1:		binutils-2.42-cygwin-config-rpath.patch
+Patch1:         binutils-2.42-cygwin-config-rpath.patch
+
+Patch101:       0001-aarch64-Implement-Structured-Exception-Handling-SEH-.patch
+Patch102:       0002-WIP-fix-to-dll-relocations.patch
+Patch103:       0003-Add-error-messages-for-invalid-relocations.patch
+Patch105:       0005-Add-aarch64-pc-cygwin-target.patch
+Patch107:       0007-Add-auto-import-support-to-AArch64-9.patch
+Patch108:       0008-PE-COFF-AArch64-avoid-ADRP-for-ABS-small-constants.patch
+Patch109:       0009-ld-pep.em-use-mingw_behavior-for-the-aarch64-cygwin-.patch
+Patch110:       0010-bfd-restore-the-section_htab-guards-removed-by-b3dcd.patch
+
 
 BuildRequires:  gcc
 BuildRequires:  flex
@@ -32,7 +42,11 @@ BuildRequires:  cygwin64
 BuildRequires:  cygwin64-gettext
 BuildRequires:  cygwin64-zlib
 
-%undefine cygwin_build_aarch64
+BuildRequires:  cygwin-aarch64-filesystem
+BuildRequires:  cygwin-aarch64-gcc
+BuildRequires:  cygwin-aarch64
+BuildRequires:  cygwin-aarch64-gettext
+BuildRequires:  cygwin-aarch64-zlib
 
 %description
 This package contains Cygwin cross-compiled BFD and opcodes static
@@ -64,12 +78,27 @@ This package contains Cygwin x86_64 cross-compiled BFD and opcodes static
 libraries. Only static libraries are provided because the API is too
 unstable to be used dynamically.
 
+%package -n cygwin-aarch64-libbfd
+Summary:        Cygwin aarch64 BFD and opcodes libraries
+Group:          Development/Libraries
+Requires:       cygwin-aarch64-filesystem
+Requires:       cygwin-aarch64
+Requires:       cygwin-aarch64-gettext-static
+Requires:       cygwin-aarch64-zlib-static
+
+%description -n cygwin-aarch64-libbfd
+This package contains Cygwin aarch64 cross-compiled BFD and opcodes static
+libraries. Only static libraries are provided because the API is too
+unstable to be used dynamically.
+
 
 %prep
 %autosetup -n binutils-%{version} -p1
 
 
 %build
+%global cygwin_aarch64_cflags %{cygwin_aarch64_cflags} -O0
+
 %cygwin_configure \
   --enable-64-bit-bfd \
   --without-included-gettext \
@@ -88,6 +117,8 @@ rm -rf $RPM_BUILD_ROOT%{cygwin32_infodir}
 rm -rf $RPM_BUILD_ROOT%{cygwin32_datadir}/locale/
 rm -rf $RPM_BUILD_ROOT%{cygwin64_infodir}
 rm -rf $RPM_BUILD_ROOT%{cygwin64_datadir}/locale/
+rm -rf $RPM_BUILD_ROOT%{cygwin_aarch64_infodir}
+rm -rf $RPM_BUILD_ROOT%{cygwin_aarch64_datadir}/locale/
 
 # Do not ship .la files
 find $RPM_BUILD_ROOT -name '*.la' -delete
@@ -133,8 +164,31 @@ find $RPM_BUILD_ROOT -name '*.la' -delete
 %{cygwin64_includedir}/sframe.h
 %{cygwin64_libdir}/libsframe.a
 
+%files -n cygwin-aarch64-libbfd
+%{cygwin_aarch64_includedir}/ansidecl.h
+%{cygwin_aarch64_includedir}/bfd.h
+%{cygwin_aarch64_includedir}/bfdlink.h
+%{cygwin_aarch64_includedir}/ctf.h
+%{cygwin_aarch64_includedir}/ctf-api.h
+%{cygwin_aarch64_includedir}/diagnostics.h
+%{cygwin_aarch64_includedir}/dis-asm.h
+%{cygwin_aarch64_includedir}/plugin-api.h
+%{cygwin_aarch64_includedir}/symcat.h
+%{cygwin_aarch64_includedir}/libiberty/
+%{cygwin_aarch64_libdir}/libbfd.a
+%{cygwin_aarch64_libdir}/libctf.a
+%{cygwin_aarch64_libdir}/libctf-nobfd.a
+%{cygwin_aarch64_libdir}/libiberty.a
+%{cygwin_aarch64_libdir}/libopcodes.a
+%{cygwin_aarch64_includedir}/sframe-api.h
+%{cygwin_aarch64_includedir}/sframe.h
+%{cygwin_aarch64_libdir}/libsframe.a
+
 
 %changelog
+* Mon Sep 28 2026 Jon Turney <jon.turney@dronecode.org.uk> - 2.42-2
+- add aarch64
+
 * Mon Sep 28 2026 Jon Turney <jon.turney@dronecode.org.uk> - 2.42-1
 - new version
 

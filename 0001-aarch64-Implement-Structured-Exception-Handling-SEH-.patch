@@ -1,0 +1,1750 @@
+From f5ea9578baad7b26b848abd0457eadc87951d558 Mon Sep 17 00:00:00 2001
+From: Evgeny Karpov <evgeny.karpov@arm.com>
+Date: Fri, 7 Aug 2026 16:37:11 +0200
+Subject: [PATCH 01/10] aarch64: Implement Structured Exception Handling (SEH)
+ on AArch64
+
+The patch reuses shared helpers for SEH and implements SEH on AArch64.
+The implementation is based on
+(https://learn.microsoft.com/en-us/cpp/build/arm64-exception-handling?view=msvc-170)
+and pdata/xdata SEH records are emitted from md_finish.
+
+When .pdata/.xdata is emitted, the function size is required.
+Function sizes are calculated as late as possible, and the code segment needs
+to be relaxed to be able to calculate the function sizes.
+
+Initially, obj_coff_generate_pdata was called in write_object_file.
+Before the change, obj_coff_generate_pdata was used only to validate
+syntax, which was sufficient for that purpose. However, that location
+seems incorrect, as it is too late to emit .pdata/.xdata records
+in the AArch64 case.
+
+md_finish has been declared for AArch64 and extended with
+seh_aarch64_write_data to emit .pdata/.xdata records after all
+assembly has been completed.
+
+Signed-off-by: Evgeny Karpov <evgeny@kmaps.co>
+
+gas/ChangeLog:
+	* gas/config/obj-coff-seh-shared.c (defined): Update.
+	(struct seh_seg_list): Use seh_context_t.
+	* gas/config/obj-coff.c (defined): Update.
+	* gas/config/tc-aarch64.c (defined): Add OBJ_COFF guard.
+	(aarch64_md_finish): Add.
+	* gas/config/tc-aarch64.h (defined): Add OBJ_COFF guard.
+	(md_finish): Add.
+	(aarch64_md_finish): Add.
+	(seh_aarch64_write_data): Add.
+	* testsuite/gas/pe/pe.exp: Add SEH tests.
+	* write.c: Update.
+	* write.h (subsegs_finish_section): Update.
+	* config/obj-coff-seh-aarch64.c: New file.
+	* config/obj-coff-seh-aarch64.h: New file.
+	* testsuite/gas/pe/seh-aarch64-error.l: New test.
+	* testsuite/gas/pe/seh-aarch64-error.s: New test.
+	* testsuite/gas/pe/seh-aarch64-large-func.d: New test.
+	* testsuite/gas/pe/seh-aarch64-large-func.s: New test.
+	* testsuite/gas/pe/seh-aarch64.d: New test.
+	* testsuite/gas/pe/seh-aarch64.s: New test.
+---
+ gas/config/obj-coff-seh-aarch64.c             | 868 ++++++++++++++++++
+ gas/config/obj-coff-seh-aarch64.h             | 214 +++++
+ gas/config/obj-coff-seh-shared.c              |   8 +-
+ gas/config/obj-coff.c                         |   4 +
+ gas/config/tc-aarch64.c                       |  10 +
+ gas/config/tc-aarch64.h                       |   6 +
+ gas/testsuite/gas/pe/pe.exp                   |   3 +
+ gas/testsuite/gas/pe/seh-aarch64-error.l      | 110 +++
+ gas/testsuite/gas/pe/seh-aarch64-error.s      | 128 +++
+ gas/testsuite/gas/pe/seh-aarch64-large-func.d |  53 ++
+ gas/testsuite/gas/pe/seh-aarch64-large-func.s |  13 +
+ gas/testsuite/gas/pe/seh-aarch64.d            |  69 ++
+ gas/testsuite/gas/pe/seh-aarch64.s            |  49 +
+ gas/write.c                                   |   2 +-
+ gas/write.h                                   |   1 +
+ 15 files changed, 1536 insertions(+), 2 deletions(-)
+ create mode 100644 gas/config/obj-coff-seh-aarch64.c
+ create mode 100644 gas/config/obj-coff-seh-aarch64.h
+ create mode 100644 gas/testsuite/gas/pe/seh-aarch64-error.l
+ create mode 100644 gas/testsuite/gas/pe/seh-aarch64-error.s
+ create mode 100644 gas/testsuite/gas/pe/seh-aarch64-large-func.d
+ create mode 100644 gas/testsuite/gas/pe/seh-aarch64-large-func.s
+ create mode 100644 gas/testsuite/gas/pe/seh-aarch64.d
+ create mode 100644 gas/testsuite/gas/pe/seh-aarch64.s
+
+diff --git a/gas/config/obj-coff-seh-aarch64.c b/gas/config/obj-coff-seh-aarch64.c
+new file mode 100644
+index 00000000000..c3999b5b10d
+--- /dev/null
++++ b/gas/config/obj-coff-seh-aarch64.c
+@@ -0,0 +1,868 @@
++/* SEH .pdata/.xdata COFF object file format on AArch64
++   Copyright (C) 2026 Free Software Foundation, Inc.
++
++   This file is part of GAS.
++
++   GAS is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License as published by
++   the Free Software Foundation; either version 3, or (at your option)
++   any later version.
++
++   GAS is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with GAS; see the file COPYING.  If not, write to the Free
++   Software Foundation, 51 Franklin Street - Fifth Floor, Boston, MA
++   02110-1301, USA.  */
++
++#include "obj-coff-seh-aarch64.h"
++
++static struct seh_aarch64_context *seh_ctx_root = NULL;
++static bool in_seh_proc = false;
++
++struct aarch64_unwind_info {
++  const char *directive;
++  unsigned char size;
++  unsigned char code_bits;
++  unsigned char code;
++  unsigned char offset_bits;
++  unsigned char offset_shift;
++  unsigned char offset_addend;
++  unsigned char reg_bits;
++  unsigned char reg_shift;
++  unsigned char reg_addend;
++  char reg_type;
++  bool reg_pair;
++};
++
++/* Unwind codes for AArch64 are described based on
++   "Microsoft ARM64 exception handling, unwind codes documentation"
++   and calculated in seh_aarch64_add_unwind_element function.
++   aarch64_unwind_code_data is indexed by the seh_aarch64_unwind_types enum.  */
++
++static const struct aarch64_unwind_info
++aarch64_unwind_code_data[] = {
++  {
++    .size = 1,
++    .code_bits = 3, .code = 0x0,
++    .offset_bits = 5, .offset_shift = 4
++  },
++  {
++    .size = 2,
++    .code_bits = 5, .code = 0x18,
++    .offset_bits = 11, .offset_shift = 4
++  },
++  {
++    .size = 4,
++    .code_bits = 8, .code = 0xe0,
++    .offset_bits = 24, .offset_shift = 4
++  },
++  {
++    .directive = ".seh_save_reg",
++    .size = 2,
++    .code_bits = 6, .code = 0x34,
++    .offset_bits = 6, .offset_shift = 3,
++    .reg_bits = 4, .reg_addend = 19, .reg_type = 'x'
++  },
++  {
++    .directive = ".seh_save_reg_x",
++    .size = 2,
++    .code_bits = 7, .code = 0x6a,
++    .offset_bits = 5, .offset_shift = 3, .offset_addend = 1,
++    .reg_bits = 4, .reg_addend = 19, .reg_type = 'x'
++  },
++  {
++    .directive = ".seh_save_regp",
++    .size = 2,
++    .code_bits = 6, .code = 0x32,
++    .offset_bits = 6, .offset_shift = 3,
++    .reg_bits = 4, .reg_addend = 19, .reg_type = 'x', .reg_pair = true
++  },
++  {
++    .directive = ".seh_save_regp_x",
++    .size = 2,
++    .code_bits = 6, .code = 0x33,
++    .offset_bits = 6, .offset_shift = 3, .offset_addend = 1,
++    .reg_bits = 4, .reg_addend = 19, .reg_type = 'x', .reg_pair = true
++  },
++  {
++    .directive = ".seh_save_fregp",
++    .size = 2,
++    .code_bits = 7, .code = 0x6c,
++    .offset_bits = 6, .offset_shift = 3,
++    .reg_bits = 3, .reg_addend = 8, .reg_type = 'd'
++  },
++  {
++    .directive = ".seh_save_fregp_x",
++    .size = 2,
++    .code_bits = 7, .code = 0x6d,
++    .offset_bits = 6, .offset_shift = 3, .offset_addend = 1,
++    .reg_bits = 3, .reg_addend = 8, .reg_type = 'd'
++  },
++  {
++    .directive = ".seh_save_freg",
++    .size = 2,
++    .code_bits = 7, .code = 0x6e,
++    .offset_bits = 6, .offset_shift = 3,
++    .reg_bits = 3, .reg_addend = 8, .reg_type = 'd'
++  },
++  {
++    .directive = ".seh_save_freg_x",
++    .size = 2,
++    .code_bits = 8, .code = 0xde,
++    .offset_bits = 5, .offset_shift = 3, .offset_addend = 1,
++    .reg_bits = 3, .reg_addend = 8, .reg_type = 'd'
++  },
++  {
++    .directive = ".seh_save_lrpair",
++    .size = 2,
++    .code_bits = 7, .code = 0x6b,
++    .offset_bits = 6, .offset_shift = 3,
++    .reg_bits = 3, .reg_shift = 1, .reg_addend = 19, .reg_type = 'x'
++  },
++  {
++    .directive = ".seh_save_fplr",
++    .size = 1,
++    .code_bits = 2, .code = 0x1,
++    .offset_bits = 6, .offset_shift = 3
++  },
++  {
++    .directive = ".seh_save_fplr_x",
++    .size = 1,
++    .code_bits = 2, .code = 0x2,
++    .offset_bits = 6, .offset_shift = 3, .offset_addend = 1
++  },
++  {
++    .directive = ".seh_save_r19r20_x",
++    .size = 1,
++    .code_bits = 3, .code = 0x1,
++    .offset_bits = 5, .offset_shift = 3
++  },
++  {
++    .directive = ".seh_add_fp",
++    .size = 2,
++    .code_bits = 8, .code = 0xe2,
++    .offset_bits = 8, .offset_shift = 3
++  },
++  {
++    .directive = ".seh_set_fp",
++    .size = 1,
++    .code_bits = 8, .code = 0xe1
++  },
++  {
++    .directive = ".seh_save_next",
++    .size = 1,
++    .code_bits = 8, .code = 0xe6
++  },
++  {
++    .directive = ".seh_nop",
++    .size = 1,
++    .code_bits = 8, .code = 0xe3
++  },
++  {
++    .directive = ".seh_pac_sign_lr",
++    .size = 1,
++    .code_bits = 8, .code = 0xfc
++  },
++  {
++    .size = 1,
++    .code_bits = 8, .code = 0xe4
++  },
++};
++
++/* Set for current context the default handler.  */
++static void
++obj_coff_seh_handler (const int what ATTRIBUTE_UNUSED)
++{
++  char *symbol_name;
++  char name_end;
++
++  if (!verify_context (".seh_handler"))
++    return;
++
++  if (*input_line_pointer == 0 || *input_line_pointer == '\n')
++    as_bad (_(".seh_handler requires a handler"));
++
++  SKIP_WHITESPACE ();
++
++  if (*input_line_pointer == '@')
++    {
++      name_end = get_symbol_name (&symbol_name);
++
++      seh_ctx_cur->handler.X_op = O_constant;
++      seh_ctx_cur->handler.X_add_number = 0;
++
++      if (strcasecmp (symbol_name, "@1") == 0)
++	seh_ctx_cur->handler.X_add_number = 1;
++      else if (strcasecmp (symbol_name, "@0")
++	       && strcasecmp (symbol_name, "@null"))
++	as_bad (_("unknown constant value '%s' for handler"), symbol_name);
++
++      (void) restore_line_pointer (name_end);
++    }
++  else
++    expression (&seh_ctx_cur->handler);
++
++  seh_ctx_cur->handler_data.X_op = O_constant;
++  seh_ctx_cur->handler_data.X_add_number = 0;
++  seh_ctx_cur->has_exception_data = true;
++
++  while (skip_whitespace_and_comma (0))
++    {
++      name_end = get_symbol_name (&symbol_name);
++      (void) restore_line_pointer (name_end);
++    }
++}
++
++/* Switch to subsection for handler data for exception region.  */
++static void
++obj_coff_seh_handlerdata (const int what ATTRIBUTE_UNUSED)
++{
++  demand_empty_rest_of_line ();
++
++  switch_xdata (seh_ctx_cur->subsection + 1, seh_ctx_cur->code_seg);
++  seh_ctx_cur->handler_data_xdata_addr = symbol_temp_new_now ();
++}
++
++/* Switch back to the code section.  */
++static void
++obj_coff_seh_code (int ignored ATTRIBUTE_UNUSED)
++{
++  subseg_set (seh_ctx_cur->code_seg, 0);
++}
++
++/* Obtain available unwind element.  */
++static void
++seh_aarch64_add_unwind_element (const seh_aarch64_unwind_types unwind_type,
++				unsigned offset, unsigned reg)
++{
++  const struct aarch64_unwind_info *info
++    = aarch64_unwind_code_data + unwind_type;
++  unsigned value_offset_bits = 0;
++
++  if ((seh_ctx_cur->unwind_codes_byte_count
++      + info->size) > AARCH64_MAX_UNWIND_CODES_SIZE)
++    as_bad (_("no unwind element available."));
++
++  unsigned value = 0;
++
++  if (info->offset_bits)
++    {
++      const unsigned offset_multiplier = 1u << info->offset_shift;
++      if (offset & (offset_multiplier - 1))
++	as_bad (_("offset should be a multiple of %u"), offset_multiplier);
++      offset = (offset >> info->offset_shift) - info->offset_addend;
++      if (offset >= (1u << info->offset_bits))
++	as_bad (_("offset overflows expected range"));
++      value |= offset << value_offset_bits;
++      value_offset_bits += info->offset_bits;
++    }
++
++  if (info->reg_bits)
++    {
++      const unsigned reg_multiplier = 1u << info->reg_shift;
++      reg -= info->reg_addend;
++      if (reg & (reg_multiplier - 1))
++	as_bad (_("unexpected register number"));
++      reg >>= info->reg_shift;
++      if (reg >= (1u << info->reg_bits))
++	as_bad (_("unexpected register number"));
++      value |= reg << value_offset_bits;
++      value_offset_bits += info->reg_bits;
++    }
++
++  const unsigned code = info->code;
++  gas_assert (code < (1u << info->code_bits));
++  value |= code << value_offset_bits;
++
++  seh_aarch64_unwind_code *element;
++  element = seh_ctx_cur->unwind_codes + seh_ctx_cur->unwind_codes_count++;
++  element->type = unwind_type;
++  element->value = value;
++
++  seh_ctx_cur->unwind_codes_byte_count += info->size;
++}
++
++/* Mark begin of new context.  */
++static void
++obj_coff_seh_proc (const int what ATTRIBUTE_UNUSED)
++{
++  char *symbol_name;
++  char name_end;
++
++  if (in_seh_proc)
++    as_bad (_("previous SEH entry not closed (missing .seh_endproc)"));
++
++  if (*input_line_pointer == 0 || *input_line_pointer == '\n')
++    as_bad (_(".seh_proc requires function label name"));
++
++
++  if (!seh_ctx_root)
++    {
++      seh_ctx_root = XCNEW (seh_context);
++      seh_ctx_cur = seh_ctx_root;
++    }
++  else
++    {
++      seh_ctx_cur->next = XCNEW (seh_context);
++      seh_ctx_cur = seh_ctx_cur->next;
++    }
++
++  seh_ctx_cur->next = NULL;
++  seh_ctx_cur->code_seg = now_seg;
++
++  /* The current implementation always use a pair of .pdata and .xdata
++     records.  */
++  const bool use_xdata = true;
++
++  if (use_xdata)
++    {
++      x_segcur = seh_hash_find_or_make (seh_ctx_cur->code_seg, ".xdata");
++      seh_ctx_cur->subsection = x_segcur->subseg;
++      x_segcur->subseg += 2;
++
++      /* Initialize an empty .xdata record.  */
++      seh_ctx_cur->unwind_codes_count = 0;
++      seh_ctx_cur->unwind_codes_byte_count = 0;
++      seh_ctx_cur->epilogue_scopes_count = 0;
++      seh_ctx_cur->epilogue_scopes_capacity = 0;
++      seh_ctx_cur->epilogue_scopes = NULL;
++      seh_ctx_cur->has_exception_data = false;
++    }
++
++  SKIP_WHITESPACE ();
++
++  name_end = get_symbol_name (&symbol_name);
++  seh_ctx_cur->func_name = xstrdup (symbol_name);
++  (void) restore_line_pointer (name_end);
++
++  demand_empty_rest_of_line ();
++
++  seh_ctx_cur->start_addr = symbol_temp_new_now ();
++  in_seh_proc = true;
++}
++
++/* Mark end of prologue for current context.  */
++static void
++obj_coff_seh_endprologue (const int what ATTRIBUTE_UNUSED)
++{
++  if (!verify_context (".seh_endprologue")
++      || !seh_validate_seg (".seh_endprologue"))
++    return;
++  demand_empty_rest_of_line ();
++
++  if (seh_ctx_cur->endprologue_addr != NULL)
++    as_warn (_("duplicate .seh_endprologue in .seh_proc block"));
++  else
++    seh_ctx_cur->endprologue_addr = symbol_temp_new_now ();
++
++  /* Unwind codes need to be reversed.  */
++  for (unsigned i = 0, n = seh_ctx_cur->unwind_codes_count; i < n / 2; ++i)
++    {
++      seh_aarch64_unwind_code *unwind_codes = seh_ctx_cur->unwind_codes;
++      const seh_aarch64_unwind_code temp = unwind_codes[i];
++      unwind_codes[i] = unwind_codes[n-i-1];
++      unwind_codes[n-i-1] = temp;
++    }
++
++   seh_aarch64_add_unwind_element (unwind_end, 0, 0);
++}
++
++/* Mark end of current context.  */
++static void
++obj_coff_seh_endproc (const int what ATTRIBUTE_UNUSED)
++{
++  demand_empty_rest_of_line ();
++  if (!in_seh_proc)
++    {
++      as_bad (_(".seh_endproc used without .seh_proc"));
++      return;
++    }
++
++  seh_validate_seg (".seh_endproc");
++
++  seh_ctx_cur->end_addr = symbol_temp_new_now ();
++  in_seh_proc = false;
++}
++
++static void
++obj_coff_seh_startepilogue (const int what ATTRIBUTE_UNUSED)
++{
++  if (!verify_context (".seh_startepilogue")
++      || !seh_validate_seg (".seh_startepilogue"))
++    return;
++  demand_empty_rest_of_line ();
++
++  if (seh_ctx_cur->epilogue_scopes_count >= AARCH64_MAX_EPILOGUE_SCOPES)
++    as_bad (_("no epilogue scopes available."));
++
++  symbolS *epilogue_start_addr = symbol_temp_new_now ();
++  expressionS exp;
++  exp.X_op = O_subtract;
++  exp.X_add_symbol = epilogue_start_addr;
++  exp.X_op_symbol = seh_ctx_cur->start_addr;
++  exp.X_add_number = 0;
++
++  if (!resolve_expression (&exp) || exp.X_op != O_constant
++      || exp.X_add_number < 0)
++    as_bad (_(".seh_startepilogue offset expression for %s "
++	    "does not evaluate to a non-negative constant"),
++	    S_GET_NAME (epilogue_start_addr));
++
++  if (seh_ctx_cur->epilogue_scopes_count
++      >= seh_ctx_cur->epilogue_scopes_capacity)
++    {
++      const unsigned initial_capacity = 32;
++      if (seh_ctx_cur->epilogue_scopes_capacity)
++	seh_ctx_cur->epilogue_scopes_capacity *= 2;
++      else
++	seh_ctx_cur->epilogue_scopes_capacity = initial_capacity;
++
++      seh_ctx_cur->epilogue_scopes
++	= XRESIZEVEC (seh_aarch64_epilogue_scope, seh_ctx_cur->epilogue_scopes,
++		     seh_ctx_cur->epilogue_scopes_capacity);
++    }
++
++  seh_aarch64_epilogue_scope *epilogue_scope = seh_ctx_cur->epilogue_scopes
++    + seh_ctx_cur->epilogue_scopes_count;
++  epilogue_scope->epilogue_start_offset = exp.X_add_number / 4;
++  epilogue_scope->reserved = 0;
++  epilogue_scope->epilogue_start_index = 0;
++  seh_ctx_cur->epilogue_scopes_count++;
++}
++
++static void
++obj_coff_seh_endepilogue (const int what ATTRIBUTE_UNUSED)
++{
++  if (!verify_context (".seh_endepilogue")
++      || !seh_validate_seg (".seh_endepilogue"))
++    return;
++
++  demand_empty_rest_of_line ();
++
++  expressionS exp;
++  symbolS *epilogue_end_addr = symbol_temp_new_now ();
++  exp.X_op = O_subtract;
++  exp.X_add_symbol = epilogue_end_addr;
++  exp.X_op_symbol = seh_ctx_cur->start_addr;
++  exp.X_add_number = 0;
++
++  if (!resolve_expression (&exp) || exp.X_op != O_constant
++      || exp.X_add_number < 0)
++    as_bad (_(".seh_endepilogue offset expression for %s "
++	    "does not evaluate to a non-negative constant"),
++	    S_GET_NAME (epilogue_end_addr));
++
++   seh_aarch64_epilogue_scope *epilogue_scope = seh_ctx_cur->epilogue_scopes
++     + seh_ctx_cur->epilogue_scopes_count - 1;
++
++   epilogue_scope->epilogue_end_offset = exp.X_add_number;
++
++  /* End code.  */
++  seh_aarch64_add_unwind_element (unwind_end, 0, 0);
++}
++
++/* End-of-file hook.  */
++static void
++free_seh_ctx (struct seh_aarch64_context *seh_ctx)
++{
++  free (seh_ctx->func_name);
++  const seh_aarch64_func_fragment *fragment = seh_ctx->func_fragment.next;
++  while (fragment)
++    {
++      const seh_aarch64_func_fragment *next = fragment->next;
++      XDELETE (fragment);
++      fragment = next;
++    }
++  XDELETEVEC (seh_ctx->epilogue_scopes);
++  free (seh_ctx);
++}
++
++static void
++obj_coff_seh_save_reg (const int type)
++{
++  gas_assert (type >= 0 && type <= unwind_last_type);
++
++  const struct aarch64_unwind_info *info
++    = aarch64_unwind_code_data + type;
++
++  SKIP_WHITESPACE ();
++
++  char *symbol_name = NULL;
++  unsigned reg = -1;
++
++  if (info->reg_bits)
++    {
++      char name_end = get_symbol_name (&symbol_name);
++      if (info->reg_type != *symbol_name)
++	as_bad ("unexpected register name");
++
++      reg = atoi (symbol_name + 1);
++      (void) restore_line_pointer (name_end);
++
++      if (!skip_whitespace_and_comma (1))
++	return;
++
++      /* Check that referenced registers are not higher than x30.  */
++      if (info->reg_type == 'x' && (reg + (info->reg_pair ? 1 : 0)) > 30)
++	as_bad (_("unexpected register number"));
++    }
++
++  offsetT off = -1;
++  if (info->offset_bits)
++    {
++      off = get_absolute_expression ();
++
++      if (off < 0)
++	as_bad (_("offset is negative"));
++    }
++
++  demand_empty_rest_of_line ();
++
++  if (!in_seh_proc)
++  {
++    as_bad (_("SEH entry has not been found (missing .seh_proc)"));
++    return;
++  }
++
++  if (!info->directive || !seh_validate_seg (info->directive))
++    return;
++
++  seh_aarch64_add_unwind_element (type, off, reg);
++}
++
++/* Add a stack-allocation token to current context.  */
++static void
++obj_coff_seh_stackalloc (const int what ATTRIBUTE_UNUSED)
++{
++  const offsetT off = get_absolute_expression ();
++  demand_empty_rest_of_line ();
++
++  if (!in_seh_proc)
++    {
++      as_bad (_("SEH entry has not been found (missing .seh_proc)"));
++      return;
++    }
++
++  if (off < 0x200)
++    seh_aarch64_add_unwind_element (unwind_alloc_s, off, 0);
++  else if (off < 0x8000)
++    seh_aarch64_add_unwind_element (unwind_alloc_m, off, 0);
++  else if (off < 0x10000000)
++    seh_aarch64_add_unwind_element (unwind_alloc_l, off, 0);
++  else
++    as_bad (_(".seh_stackalloc offset is out of range"));
++}
++
++/* Data writing routines.  */
++static void
++seh_aarch64_emit_epilogue_scopes (const seh_context *seh_ctx,
++				  const uint64_t fragment_offset,
++				  const unsigned first_fragment_scope,
++				  const unsigned last_fragment_scope)
++{
++  for (unsigned i = first_fragment_scope; i < last_fragment_scope; ++i)
++    {
++      seh_aarch64_epilogue_scope scope = seh_ctx->epilogue_scopes[i];
++      scope.epilogue_start_offset_reduced = (scope.epilogue_start_offset
++					    - fragment_offset) >> 2;
++
++      const unsigned char epilogue_start_index_shift = 22;
++      uint32_t scope_code = scope.epilogue_start_offset_reduced;
++      scope_code |= scope.epilogue_start_index << epilogue_start_index_shift;
++
++      md_number_to_chars (frag_more (4), scope_code, 4);
++    }
++}
++
++static void
++seh_aarch64_emit_unwind_codes (const seh_context *seh_ctx,
++			       const bool has_phantom_prologue)
++{
++  unsigned total_byte_count = 0;
++
++  if (has_phantom_prologue)
++    {
++      ++total_byte_count;
++      const unsigned endc_code = 0xe5;
++      md_number_to_chars (frag_more (1), endc_code, 1);
++    }
++
++  for (unsigned i = 0; i < seh_ctx->unwind_codes_count; ++i)
++    {
++      const seh_aarch64_unwind_code *code = seh_ctx->unwind_codes + i;
++      const unsigned byte_count = aarch64_unwind_code_data[code->type].size;
++
++      /*  emit unwind code bytes in big endian.  */
++      number_to_chars_bigendian (frag_more (byte_count), code->value,
++				 byte_count);
++      total_byte_count += byte_count;
++    }
++
++    /* Handle word alignment.  */
++    const unsigned required_padding = (-total_byte_count) % 4;
++    if (required_padding)
++      {
++	/* Use the nop unwind code for alignment.  */
++	const uint32_t nop_chain = 0xe3e3e3e3;
++
++	md_number_to_chars (frag_more (required_padding), nop_chain,
++			    required_padding);
++      }
++}
++
++static void
++seh_aarch64_emit_xdata_record (struct seh_aarch64_context *seh_ctx,
++			       const uintptr_t frag_size,
++			       const uintptr_t fragment_offset,
++			       const unsigned first_fragment_scope,
++			       const unsigned last_fragment_scope)
++{
++  unsigned epilogue_count = last_fragment_scope - first_fragment_scope;
++
++  /* Calculate how many unwind bytes will be emitted in .xdata record.  */
++  unsigned unwind_bytes = seh_ctx->unwind_codes_byte_count;
++
++  /* Check if current fragment has a phantom prologue.  If yes, then
++      the unwinding size should be adjusted.  */
++  const bool has_phantom_prologue = fragment_offset != 0;
++  if (has_phantom_prologue)
++    unwind_bytes += 1;
++
++  /* Calculate the number of code words with 4-byte alignment.  */
++  unsigned code_words = (unwind_bytes + 3) / 4;
++
++  /* Initialize the .xdata header.  */
++  const unsigned char has_exception_data_shift = 20;
++  const unsigned char epilogue_count_shift = 22;
++  const unsigned char code_words_shift = 27;
++  const unsigned char ext_epilogue_count_shift = 32;
++  const unsigned char ext_code_words_shift = 48;
++  const uint32_t func_length_encoded = frag_size >> 2;
++  uint64_t header = 0;
++  header |= func_length_encoded;
++  header |= seh_ctx->has_exception_data << has_exception_data_shift;
++
++  /* Check if short or extended header for a .xdata record should be
++      used.  */
++  unsigned header_size = 8;
++  if (code_words < 32 && epilogue_count < 32)
++    {
++      header_size = 4;
++      header |= epilogue_count << epilogue_count_shift;
++      header |= code_words << code_words_shift;
++    }
++  else
++    {
++      header |= (uint64_t) epilogue_count << ext_epilogue_count_shift;
++      header |= (uint64_t) code_words << ext_code_words_shift;
++    }
++
++  md_number_to_chars (frag_more (header_size), header, header_size);
++
++  if (epilogue_count)
++    seh_aarch64_emit_epilogue_scopes (seh_ctx,
++				      fragment_offset,
++				      first_fragment_scope,
++				      last_fragment_scope);
++
++  seh_aarch64_emit_unwind_codes (seh_ctx, has_phantom_prologue);
++
++  if (seh_ctx->has_exception_data)
++    {
++      if (seh_ctx->handler.X_op == O_symbol)
++	seh_ctx->handler.X_op = O_symbol_rva;
++
++      emit_expr (&seh_ctx->handler, 4);
++
++      /* Emit the fragment offset.  */
++      md_number_to_chars (frag_more (4), fragment_offset, 4);
++
++      /* Use the same SEH handler data for all fragments.
++	 The SEH handler data is emitted after the last fragment.  */
++      expressionS exp;
++      memset (&exp, 0, sizeof (expressionS));
++      exp.X_op = O_symbol_rva;
++      exp.X_add_symbol = seh_ctx->handler_data_xdata_addr;
++      emit_expr (&exp, 4);
++    }
++}
++
++static bool
++seh_function_size (const struct seh_aarch64_context *seh_ctx,
++		  uintptr_t *size)
++{
++  fragS *start_frag, *end_frag;
++  addressT start_offset, end_offset;
++  start_frag = symbol_get_frag_and_value (seh_ctx->start_addr, &start_offset);
++  end_frag = symbol_get_frag_and_value (seh_ctx->end_addr, &end_offset);
++
++  intptr_t func_size = end_frag->fr_address + end_offset
++		       - start_frag->fr_address - start_offset;
++  if (func_size < 0)
++    return false;
++
++  *size = func_size;
++  return true;
++}
++
++/* Write out the xdata information for one function.  */
++static void
++seh_aarch64_write_function_xdata (struct seh_aarch64_context *seh_ctx)
++{
++  if (!seh_ctx->unwind_codes_byte_count)
++    return;
++
++  const segT save_seg = now_seg;
++  const subsegT save_subseg = now_subseg;
++
++  switch_xdata (seh_ctx->subsection, seh_ctx->code_seg);
++
++  /* Set 4-byte alignment.  */
++  frag_align (2, 0, 0);
++
++  uintptr_t func_size = 0;
++  gas_assert (seh_function_size (seh_ctx, &func_size));
++
++  /* The large functions should be split into fragments smaller than 1MB with
++     4 bytes alignment, based on
++     "Microsoft ARM64 exception handling, large functions documentation".  */
++  const unsigned max_frag_size = (1 << 20) - 4;
++
++  seh_aarch64_func_fragment *fragment = &seh_ctx->func_fragment;
++  uintptr_t fragment_offset = 0;
++  unsigned first_fragment_scope = 0;
++  unsigned last_fragment_scope = 0;
++
++  /* Large functions (>= 1MB) will be split into multiple fragments.
++     However, it is expected the most of the functions will have only one
++     fragment.  This loop iterates fragments and emits them.  */
++  while (true)
++    {
++      fragment->xdata_addr = symbol_temp_new_now ();
++      fragment->offset = fragment_offset;
++      fragment->next = NULL;
++
++      /* Calculate current fragment size.  */
++      uintptr_t frag_size = func_size - fragment_offset;
++      if (frag_size > max_frag_size)
++	frag_size = max_frag_size;
++
++      /* If it is a fragmented function, the epilogue range should be calculated
++	 and will be emitted for the current fragment, otherwise all epilogues
++	 will be emitted.  */
++      const bool is_fragmented_function = func_size > max_frag_size;
++      if (!is_fragmented_function)
++	last_fragment_scope = seh_ctx->epilogue_scopes_count;
++      else
++	{
++	  first_fragment_scope = last_fragment_scope;
++	  for (unsigned i = first_fragment_scope;
++	       i < seh_ctx->epilogue_scopes_count; ++i)
++	    {
++	      const seh_aarch64_epilogue_scope *scope
++		= seh_ctx->epilogue_scopes;
++	      scope += i;
++	      if (scope->epilogue_start_offset >= (fragment_offset + frag_size))
++		break;
++
++	      if (scope->epilogue_end_offset >= (fragment_offset + frag_size))
++		{
++		  frag_size = scope->epilogue_start_offset - fragment_offset;
++		  break;
++		}
++
++	      if (scope->epilogue_start_offset >= fragment_offset)
++		last_fragment_scope = i + 1;
++	    }
++	}
++
++
++      /* Emit a .xdata record for the current fragment.  */
++      seh_aarch64_emit_xdata_record (seh_ctx,
++				     frag_size, fragment_offset,
++				     first_fragment_scope, last_fragment_scope);
++
++      fragment_offset += frag_size;
++      /* Exit the loop if it is the latest fragment.  */
++      if (fragment_offset == func_size)
++	break;
++
++      /* Allocate a new fragment that will be used also for emitting a .pdata
++	 record.  */
++      fragment->next = XCNEW (seh_aarch64_func_fragment);
++      fragment = fragment->next;
++    }
++
++  subseg_set (save_seg, save_subseg);
++}
++
++/* Write out pdata for one function.  */
++static void
++seh_aarch64_write_function_pdata (const seh_context *seh_ctx)
++{
++  expressionS exp;
++  const segT save_seg = now_seg;
++  const subsegT save_subseg = now_subseg;
++  memset (&exp, 0, sizeof (expressionS));
++  switch_pdata (seh_ctx->code_seg);
++
++  if (seh_ctx->unwind_codes_byte_count)
++    {
++      const seh_aarch64_func_fragment *fragment = &seh_ctx->func_fragment;
++      while (fragment)
++	{
++	  exp.X_op = O_symbol_rva;
++	  exp.X_add_number = fragment->offset;
++	  exp.X_add_symbol = seh_ctx->start_addr;
++	  emit_expr (&exp, 4);
++
++	  exp.X_op = O_symbol_rva;
++	  /* TODO: Implementing packed unwind data.  */
++	  exp.X_add_number = 0;
++	  exp.X_add_symbol = fragment->xdata_addr;
++	  emit_expr (&exp, 4);
++	  fragment = fragment->next;
++	}
++    }
++
++  subseg_set (save_seg, save_subseg);
++}
++
++void
++seh_aarch64_write_data (void)
++{
++  if (in_seh_proc)
++  {
++    as_bad (_("open SEH entry at end of file (missing .seh_endproc)"));
++    return;
++  }
++
++  if (!seh_ctx_root)
++    return;
++
++  struct seh_aarch64_context *seh_ctx = seh_ctx_root;
++  seh_ctx_root = NULL;
++
++  /* Relax the segment to be able to calculate the function sizes.  */
++  subsegs_finish_section (seh_ctx->code_seg);
++  const segment_info_type *seginfo = seg_info (seh_ctx->code_seg);
++  relax_segment (seginfo->frchainP->frch_root, seh_ctx->code_seg, 0);
++
++  while (seh_ctx)
++  {
++    seh_aarch64_write_function_xdata (seh_ctx);
++    seh_aarch64_write_function_pdata (seh_ctx);
++    struct seh_aarch64_context *next = seh_ctx->next;
++    free_seh_ctx (seh_ctx);
++    seh_ctx = next;
++  }
++}
++
++void
++obj_coff_seh_do_final (void)
++{
++}
+diff --git a/gas/config/obj-coff-seh-aarch64.h b/gas/config/obj-coff-seh-aarch64.h
+new file mode 100644
+index 00000000000..4d661f68acd
+--- /dev/null
++++ b/gas/config/obj-coff-seh-aarch64.h
+@@ -0,0 +1,214 @@
++/* SEH .pdata/.xdata COFF object file format on AArch64
++   Copyright (C) 2026 Free Software Foundation, Inc.
++
++   This file is part of GAS.
++
++   GAS is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License as published by
++   the Free Software Foundation; either version 3, or (at your option)
++   any later version.
++
++   GAS is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with GAS; see the file COPYING.  If not, write to the Free
++   Software Foundation, 51 Franklin Street - Fifth Floor, Boston, MA
++   02110-1301, USA.  */
++
++/* SEH COFF AArch64 implementation partially intersects with the x64
++   version, however it has a different extension to the unwind codes.
++   It emits SEH data to pdata and xdata sections.  In some cases SEH
++   data could be emitted to a packed record in the pdata section
++   without the need for data in the xdata section.  However, the packed
++   pdata record is not implemented yet.
++
++   The current implementation does not include:
++   - Packed .pdata record.
++   - Support for AdvSIMD and SVE.
++   - Epilogue start index different than 0.
++   - Number of unwind codes and epilogue scopes limits are applied to the
++     entire function, without splitting it into fragments.  */
++
++#ifndef OBJ_COFF_SEH_AARCH64_H
++#define OBJ_COFF_SEH_AARCH64_H
++
++/* Unwind codes for AArch64 are based on
++   "Microsoft ARM64 exception handling, unwind codes documentation".  */
++
++typedef enum seh_aarch64_unwind_types
++{
++  unwind_alloc_s,
++  unwind_alloc_m,
++  unwind_alloc_l,
++  unwind_save_reg,
++  unwind_save_reg_x,
++  unwind_save_regp,
++  unwind_save_regp_x,
++  unwind_save_fregp,
++  unwind_save_fregp_x,
++  unwind_save_freg,
++  unwind_save_freg_x,
++  unwind_save_lrpair,
++  unwind_save_fplr,
++  unwind_save_fplr_x,
++  unwind_save_r19r20_x,
++  unwind_add_fp,
++  unwind_set_fp,
++  unwind_save_next,
++  unwind_nop,
++  unwind_pac_sign_lr,
++  unwind_end,
++  unwind_end_c,
++  unwind_last_type = unwind_end_c
++} seh_aarch64_unwind_types;
++
++#define SEH_CMDS							\
++  /* Start a function that contains SEH.  */				\
++  {"seh_proc", obj_coff_seh_proc, 0},					\
++									\
++  /* End a function that contains SEH.  */				\
++  {"seh_endproc", obj_coff_seh_endproc, 0},				\
++									\
++  /* End a SEH prologue with unwinding codes.  */			\
++  {"seh_endprologue", obj_coff_seh_endprologue, 0},			\
++									\
++  /* Allocate stack.  */						\
++  {"seh_stackalloc", obj_coff_seh_stackalloc, 0},			\
++									\
++  /* Set a SEH handler.  */						\
++  {"seh_handler", obj_coff_seh_handler, 0},				\
++									\
++  /* Set a SEH handler data.  */					\
++  {"seh_handlerdata", obj_coff_seh_handlerdata, 0},			\
++									\
++  /* Switch back to the code section.  */				\
++  {"seh_code", obj_coff_seh_code, 0},					\
++									\
++  /* Start a SEH epilogue.  */						\
++  {"seh_startepilogue", obj_coff_seh_startepilogue, 0},			\
++									\
++  /* End a SEH epilogue.  */						\
++  {"seh_endepilogue", obj_coff_seh_endepilogue, 0},			\
++									\
++  /* Save an 'x' register.  */						\
++  {"seh_save_reg", obj_coff_seh_save_reg, unwind_save_reg},		\
++									\
++  /* Save an 'x' register with a pre-indexed offset.  */		\
++  {"seh_save_reg_x", obj_coff_seh_save_reg, unwind_save_reg_x},		\
++									\
++  /* Save an 'x' register pair.  */					\
++  {"seh_save_regp", obj_coff_seh_save_reg, unwind_save_regp},		\
++									\
++  /* Save an 'x' register pair with a pre-indexed offset.  */		\
++  {"seh_save_regp_x", obj_coff_seh_save_reg, unwind_save_regp_x},	\
++									\
++  /* Save an 'x' register and lr.  */					\
++  {"seh_save_lrpair", obj_coff_seh_save_reg, unwind_save_lrpair},	\
++									\
++  /* Save a 'd' register pair.  */					\
++  {"seh_save_fregp", obj_coff_seh_save_reg, unwind_save_fregp},		\
++									\
++  /* Save a 'd' register pair with a pre-indexed offset.  */		\
++  {"seh_save_fregp_x", obj_coff_seh_save_reg, unwind_save_fregp_x},	\
++									\
++  /* Save a 'd' register.  */						\
++  {"seh_save_freg", obj_coff_seh_save_reg, unwind_save_freg},		\
++									\
++  /* Save a 'd' register with a pre-indexed offset.  */			\
++  {"seh_save_freg_x", obj_coff_seh_save_reg, unwind_save_freg_x},	\
++									\
++  /* Save fp and lr registers.  */					\
++  {"seh_save_fplr", obj_coff_seh_save_reg, unwind_save_fplr},		\
++									\
++  /* Save fp and lr registers with a pre-indexed offset.  */		\
++  {"seh_save_fplr_x", obj_coff_seh_save_reg, unwind_save_fplr_x},	\
++									\
++  /* Save x19 and x20 registers with a pre-indexed offset.  */		\
++  {"seh_save_r19r20_x", obj_coff_seh_save_reg, unwind_save_r19r20_x},	\
++									\
++  /* Set fp by sp + offset.  */						\
++  {"seh_add_fp", obj_coff_seh_save_reg, unwind_add_fp},			\
++									\
++  /* Unwind operation is not required.  */				\
++  {"seh_nop", obj_coff_seh_save_reg, unwind_nop},			\
++									\
++  /* Sign the return address in lr with pacibsp.  */			\
++  {"seh_pac_sign_lr", obj_coff_seh_save_reg, unwind_pac_sign_lr},	\
++									\
++  /* Set fp by sp.  */							\
++  {"seh_set_fp", obj_coff_seh_save_reg, unwind_set_fp},			\
++									\
++  /* Save next register pair.  */					\
++  {"seh_save_next", obj_coff_seh_save_reg, unwind_save_next},
++
++/* AArch64 exceptions handling and unwinding structures are based on
++   "Microsoft ARM64 exception handling, pdata records documentation".  */
++
++typedef struct seh_aarch64_unwind_code
++{
++  unsigned value;
++  seh_aarch64_unwind_types type;
++} seh_aarch64_unwind_code;
++
++typedef struct seh_aarch64_epilogue_scope
++{
++  uint32_t epilogue_start_offset_reduced : 18;
++  uint32_t reserved : 4;
++  uint32_t epilogue_start_index : 10;
++  bfd_vma epilogue_start_offset;
++  bfd_vma epilogue_end_offset;
++} seh_aarch64_epilogue_scope;
++
++typedef struct seh_aarch64_func_fragment
++{
++  bfd_vma offset;
++  symbolS *xdata_addr;
++  struct seh_aarch64_func_fragment *next;
++} seh_aarch64_func_fragment;
++
++/* AARCH64_MAX_UNWIND_CODES is limited by
++   seh_aarch64_xdata_header::ext_code_words.  */
++#define AARCH64_MAX_UNWIND_CODES (255 * 4)
++#define AARCH64_MAX_UNWIND_CODES_SIZE (255 * 4)
++/* AARCH64_MAX_EPILOGUE_SCOPES is limited by
++   seh_aarch64_xdata_header::ext_epilogue_count.  */
++#define AARCH64_MAX_EPILOGUE_SCOPES 65535
++
++typedef struct seh_aarch64_context
++{
++  struct seh_aarch64_context *next;
++
++  /* Initial code-segment.  */
++  segT code_seg;
++  /* Function name.  */
++  char *func_name;
++  /* BeginAddress.  */
++  symbolS *start_addr;
++  /* EndAddress.  */
++  symbolS *end_addr;
++  /* PrologueEnd.  */
++  symbolS *endprologue_addr;
++
++  symbolS *handler_data_xdata_addr;
++  /* ExceptionHandler.  */
++  expressionS handler;
++  /* ExceptionHandlerData.  */
++  expressionS handler_data;
++
++  subsegT subsection;
++
++  unsigned unwind_codes_count;
++  unsigned unwind_codes_byte_count;
++  seh_aarch64_unwind_code unwind_codes[AARCH64_MAX_UNWIND_CODES];
++  unsigned epilogue_scopes_count;
++  unsigned epilogue_scopes_capacity;
++  seh_aarch64_epilogue_scope *epilogue_scopes;
++  bool has_exception_data;
++  /* The function fragments.  */
++  seh_aarch64_func_fragment func_fragment;
++} seh_context;
++
++#endif /* OBJ_COFF_SEH_AARCH64_H.  */
+diff --git a/gas/config/obj-coff-seh-shared.c b/gas/config/obj-coff-seh-shared.c
+index 717a7d345ef..b99a6bb67ee 100644
+--- a/gas/config/obj-coff-seh-shared.c
++++ b/gas/config/obj-coff-seh-shared.c
+@@ -19,7 +19,13 @@
+    Software Foundation, 51 Franklin Street - Fifth Floor, Boston, MA
+    02110-1301, USA.  */
+ 
++#if defined (COFFAARCH64)
++#include "obj-coff-seh-aarch64.h"
++typedef struct seh_aarch64_context seh_context_t;
++#else
+ #include "obj-coff-seh.h"
++typedef struct seh_context seh_context_t;
++#endif
+ 
+ /* Private segment collection list.  */
+ struct seh_seg_list {
+@@ -28,7 +34,7 @@ struct seh_seg_list {
+   char *seg_name;
+ };
+ 
+-static struct seh_context *seh_ctx_cur = NULL;
++static seh_context_t *seh_ctx_cur = NULL;
+ 
+ static htab_t seh_hash;
+ 
+diff --git a/gas/config/obj-coff.c b/gas/config/obj-coff.c
+index 7732c0af911..b08295019d8 100644
+--- a/gas/config/obj-coff.c
++++ b/gas/config/obj-coff.c
+@@ -55,7 +55,11 @@ static const char weak_altprefix[] = ".weak.";
+ #endif /* TE_PE */
+ 
+ #include "obj-coff-seh-shared.c"
++#if defined (COFFAARCH64)
++#include "obj-coff-seh-aarch64.c"
++#else
+ #include "obj-coff-seh.c"
++#endif
+ 
+ typedef struct
+   {
+diff --git a/gas/config/tc-aarch64.c b/gas/config/tc-aarch64.c
+index cb1613b3bbe..c172bbb7527 100644
+--- a/gas/config/tc-aarch64.c
++++ b/gas/config/tc-aarch64.c
+@@ -10491,6 +10491,16 @@ aarch64_cleanup (void)
+     }
+ }
+ 
++#if defined (OBJ_COFF)
++/* Called after all assembly has been done.  */
++
++void
++aarch64_md_finish (void)
++{
++  seh_aarch64_write_data ();
++}
++#endif /* OBJ_COFF.  */
++
+ #ifdef OBJ_ELF
+ /* Remove any excess mapping symbols generated for alignment frags in
+    SEC.  We may have created a mapping symbol before a zero byte
+diff --git a/gas/config/tc-aarch64.h b/gas/config/tc-aarch64.h
+index d1fb4c9058b..6446ac8efb8 100644
+--- a/gas/config/tc-aarch64.h
++++ b/gas/config/tc-aarch64.h
+@@ -82,6 +82,12 @@ struct aarch64_fix
+ 
+ #define tc_frob_section(S) aarch64_frob_section (S)
+ 
++#if defined (OBJ_COFF)
++#define md_finish aarch64_md_finish
++extern void aarch64_md_finish (void);
++extern void seh_aarch64_write_data (void);
++#endif
++
+ /* The key used to sign a function's return address.  */
+ enum pointer_auth_key {
+   AARCH64_PAUTH_KEY_A,
+diff --git a/gas/testsuite/gas/pe/pe.exp b/gas/testsuite/gas/pe/pe.exp
+index 82f217cf948..09b1a22ff35 100644
+--- a/gas/testsuite/gas/pe/pe.exp
++++ b/gas/testsuite/gas/pe/pe.exp
+@@ -63,6 +63,9 @@ if ([istarget "x86_64-*-mingw*"]) then {
+ # This test is only for AArch64
+ if {[istarget "aarch64-*-pe*"] || [istarget "aarch64-*-mingw*"]} {
+ 	run_dump_test "pe-aarch64"
++	run_dump_test "seh-aarch64"
++	run_dump_test "seh-aarch64-large-func"
++	run_list_test "seh-aarch64-error" ""
+ }
+ 
+ # Big obj
+diff --git a/gas/testsuite/gas/pe/seh-aarch64-error.l b/gas/testsuite/gas/pe/seh-aarch64-error.l
+new file mode 100644
+index 00000000000..c37beb932f0
+--- /dev/null
++++ b/gas/testsuite/gas/pe/seh-aarch64-error.l
+@@ -0,0 +1,110 @@
++.*: Assembler messages:
++.*:2: Error: .seh_endprologue used outside of .seh_proc block
++.*:3: Error: SEH entry has not been found \(missing .seh_proc\)
++.*:4: Error: SEH entry has not been found \(missing .seh_proc\)
++.*:5: Error: SEH entry has not been found \(missing .seh_proc\)
++.*:6: Error: SEH entry has not been found \(missing .seh_proc\)
++.*:7: Error: SEH entry has not been found \(missing .seh_proc\)
++.*:8: Error: SEH entry has not been found \(missing .seh_proc\)
++.*:9: Error: SEH entry has not been found \(missing .seh_proc\)
++.*:10: Error: SEH entry has not been found \(missing .seh_proc\)
++.*:11: Error: SEH entry has not been found \(missing .seh_proc\)
++.*:12: Error: SEH entry has not been found \(missing .seh_proc\)
++.*:13: Error: SEH entry has not been found \(missing .seh_proc\)
++.*:14: Error: SEH entry has not been found \(missing .seh_proc\)
++.*:15: Error: SEH entry has not been found \(missing .seh_proc\)
++.*:16: Error: SEH entry has not been found \(missing .seh_proc\)
++.*:17: Error: SEH entry has not been found \(missing .seh_proc\)
++.*:18: Error: SEH entry has not been found \(missing .seh_proc\)
++.*:19: Error: SEH entry has not been found \(missing .seh_proc\)
++.*:20: Error: SEH entry has not been found \(missing .seh_proc\)
++.*:21: Error: .seh_endproc used without .seh_proc
++.*:23: Error: .seh_proc requires function label name
++.*:24: Error: previous SEH entry not closed \(missing .seh_endproc\)
++.*:29: Error: offset overflows expected range
++.*:30: Error: offset should be a multiple of 16
++.*:31: Error: .seh_stackalloc offset is out of range
++.*:33: Error: unexpected register number
++.*:34: Error: unexpected register number
++.*:35: Error: unexpected register name
++.*:36: Error: offset is negative
++.*:36: Error: offset overflows expected range
++.*:38: Error: offset should be a multiple of 8
++.*:39: Error: offset overflows expected range
++.*:41: Error: unexpected register number
++.*:42: Error: unexpected register number
++.*:43: Error: unexpected register name
++.*:44: Error: offset is negative
++.*:44: Error: offset overflows expected range
++.*:46: Error: offset should be a multiple of 8
++.*:47: Error: offset overflows expected range
++.*:49: Error: unexpected register number
++.*:50: Error: unexpected register number
++.*:51: Error: unexpected register name
++.*:52: Error: unexpected register number
++.*:53: Error: offset is negative
++.*:53: Error: offset overflows expected range
++.*:55: Error: offset should be a multiple of 8
++.*:56: Error: offset overflows expected range
++.*:58: Error: unexpected register number
++.*:59: Error: unexpected register number
++.*:60: Error: unexpected register name
++.*:61: Error: unexpected register number
++.*:62: Error: offset is negative
++.*:62: Error: offset overflows expected range
++.*:64: Error: offset should be a multiple of 8
++.*:65: Error: offset overflows expected range
++.*:67: Error: unexpected register number
++.*:67: Error: unexpected register number
++.*:68: Error: unexpected register number
++.*:69: Error: unexpected register name
++.*:70: Error: unexpected register number
++.*:71: Error: offset is negative
++.*:71: Error: offset overflows expected range
++.*:73: Error: offset should be a multiple of 8
++.*:74: Error: offset overflows expected range
++.*:76: Error: unexpected register number
++.*:77: Error: unexpected register number
++.*:78: Error: unexpected register name
++.*:79: Error: offset is negative
++.*:79: Error: offset overflows expected range
++.*:81: Error: offset should be a multiple of 8
++.*:82: Error: offset overflows expected range
++.*:84: Error: unexpected register number
++.*:85: Error: unexpected register number
++.*:86: Error: unexpected register name
++.*:87: Error: offset is negative
++.*:87: Error: offset overflows expected range
++.*:89: Error: offset should be a multiple of 8
++.*:90: Error: offset overflows expected range
++.*:92: Error: unexpected register number
++.*:93: Error: unexpected register number
++.*:94: Error: unexpected register name
++.*:95: Error: offset is negative
++.*:95: Error: offset overflows expected range
++.*:97: Error: offset should be a multiple of 8
++.*:98: Error: offset overflows expected range
++.*:100: Error: unexpected register number
++.*:101: Error: unexpected register number
++.*:102: Error: unexpected register name
++.*:103: Error: offset is negative
++.*:103: Error: offset overflows expected range
++.*:105: Error: offset should be a multiple of 8
++.*:106: Error: offset overflows expected range
++.*:108: Error: offset is negative
++.*:108: Error: offset overflows expected range
++.*:110: Error: offset should be a multiple of 8
++.*:111: Error: offset overflows expected range
++.*:113: Error: offset is negative
++.*:113: Error: offset overflows expected range
++.*:115: Error: offset should be a multiple of 8
++.*:116: Error: offset overflows expected range
++.*:118: Error: offset is negative
++.*:118: Error: offset overflows expected range
++.*:120: Error: offset should be a multiple of 8
++.*:121: Error: offset overflows expected range
++.*:123: Error: offset is negative
++.*:123: Error: offset overflows expected range
++.*:125: Error: offset should be a multiple of 8
++.*:126: Error: offset overflows expected range
++.*: Error: open SEH entry at end of file \(missing .seh_endproc\)
+diff --git a/gas/testsuite/gas/pe/seh-aarch64-error.s b/gas/testsuite/gas/pe/seh-aarch64-error.s
+new file mode 100644
+index 00000000000..dc4118b7390
+--- /dev/null
++++ b/gas/testsuite/gas/pe/seh-aarch64-error.s
+@@ -0,0 +1,128 @@
++	.text
++	.seh_endprologue
++	.seh_stackalloc 16
++	.seh_save_reg x19, 0
++	.seh_save_reg_x x19, 16
++	.seh_save_regp x19, 32
++	.seh_save_regp_x x19, 48
++	.seh_save_lrpair x19, 64
++	.seh_save_fregp d8, 80
++	.seh_save_fregp_x d8, 96
++	.seh_save_freg d8, 112
++	.seh_save_freg_x d8, 128
++	.seh_save_fplr 144
++	.seh_save_fplr_x 160
++	.seh_save_r19r20_x 176
++	.seh_add_fp 192
++	.seh_nop
++	.seh_pac_sign_lr
++	.seh_set_fp
++	.seh_save_next
++	.seh_endproc
++
++	.seh_proc
++	.seh_proc foo
++	.seh_endproc
++
++	.seh_proc foo
++
++	.seh_stackalloc -16
++	.seh_stackalloc 268435455
++	.seh_stackalloc 268435456
++
++	.seh_save_reg x18, 0
++	.seh_save_reg x31, 0
++	.seh_save_reg d19, 0
++	.seh_save_reg x19, -8
++	.seh_save_reg x19, 504
++	.seh_save_reg x19, 511
++	.seh_save_reg x19, 512
++
++	.seh_save_reg_x x18, 16
++	.seh_save_reg_x x31, 16
++	.seh_save_reg_x d19, 16
++	.seh_save_reg_x x19, -8
++	.seh_save_reg_x x19, 256
++	.seh_save_reg_x x19, 263
++	.seh_save_reg_x x19, 264
++
++	.seh_save_regp x18, 32
++	.seh_save_regp x31, 32
++	.seh_save_regp d19, 32
++	.seh_save_regp x30, 32
++	.seh_save_regp x19, -8
++	.seh_save_regp x19, 504
++	.seh_save_regp x19, 511
++	.seh_save_regp x19, 512
++
++	.seh_save_regp_x x18, 48
++	.seh_save_regp_x x31, 48
++	.seh_save_regp_x d19, 48
++	.seh_save_regp_x x30, 48
++	.seh_save_regp_x x19, -8
++	.seh_save_regp_x x19, 512
++	.seh_save_regp_x x19, 519
++	.seh_save_regp_x x19, 520
++
++	.seh_save_lrpair x18, 64
++	.seh_save_lrpair x31, 64
++	.seh_save_lrpair d19, 64
++	.seh_save_lrpair x20, 64
++	.seh_save_lrpair x19, -8
++	.seh_save_lrpair x19, 504
++	.seh_save_lrpair x19, 511
++	.seh_save_lrpair x19, 512
++
++	.seh_save_fregp d7, 80
++	.seh_save_fregp d16, 80
++	.seh_save_fregp x8, 80
++	.seh_save_fregp d8, -8
++	.seh_save_fregp d8, 504
++	.seh_save_fregp d8, 511
++	.seh_save_fregp d8, 512
++
++	.seh_save_fregp_x d7, 96
++	.seh_save_fregp_x d16, 96
++	.seh_save_fregp_x x8, 96
++	.seh_save_fregp_x d8, -8
++	.seh_save_fregp_x d8, 512
++	.seh_save_fregp_x d8, 519
++	.seh_save_fregp_x d8, 520
++
++	.seh_save_freg d7, 112
++	.seh_save_freg d16, 112
++	.seh_save_freg x8, 112
++	.seh_save_freg d8, -8
++	.seh_save_freg d8, 504
++	.seh_save_freg d8, 511
++	.seh_save_freg d8, 512
++
++	.seh_save_freg_x d7, 128
++	.seh_save_freg_x d16, 128
++	.seh_save_freg_x x8, 128
++	.seh_save_freg_x d8, -8
++	.seh_save_freg_x d8, 256
++	.seh_save_freg_x d8, 263
++	.seh_save_freg_x d8, 264
++
++	.seh_save_fplr -8
++	.seh_save_fplr 504
++	.seh_save_fplr 511
++	.seh_save_fplr 512
++
++	.seh_save_fplr_x -8
++	.seh_save_fplr_x 512
++	.seh_save_fplr_x 519
++	.seh_save_fplr_x 520
++
++	.seh_save_r19r20_x -8
++	.seh_save_r19r20_x 248
++	.seh_save_r19r20_x 255
++	.seh_save_r19r20_x 256
++
++	.seh_add_fp -8
++	.seh_add_fp 2040
++	.seh_add_fp 2047
++	.seh_add_fp 2048
++
++	.seh_endprologue
+diff --git a/gas/testsuite/gas/pe/seh-aarch64-large-func.d b/gas/testsuite/gas/pe/seh-aarch64-large-func.d
+new file mode 100644
+index 00000000000..0c8d514321f
+--- /dev/null
++++ b/gas/testsuite/gas/pe/seh-aarch64-large-func.d
+@@ -0,0 +1,53 @@
++#objdump: -s -j .xdata
++#name: PEP aarch64 SEH large function
++
++.*:     file format pe-aarch64-little
++
++Contents of section .xdata:
++
++# .xdata SEH record
++# 0x0813ffff  code-words: 1
++#             epilogue-count: 0
++#             single-epilogue-in-header: 0
++#             exception-data: 1
++#             version: 0
++#             function-size: 1048572
++# 0x01         .seh_stackalloc 16
++# 0xe4        end
++# 0xe3        nop
++# 0xe3        nop
++# 0x00000000  seh-handler
++# 0x00000000  fragment-offset
++# 0x0000003c  seh-handle-data-address
++# 0x0833ffff  code-words: 1
++#             epilogue-count: 0
++#             single-epilogue-in-header: 1
++#             exception-data: 1
++#             version: 0
++#             function-size: 1048572
++# 0xe5        end_c
++# 0x01        .seh_stackalloc 16
++# 0xe4        end
++# 0xe3        nop
++# 0x00000000  seh-handler
++# 0x000ffffc  fragment-offset
++# 0x0000003c  seh-handle-data-address
++# 0x083002ca  code-words: 1
++#             epilogue-count: 0
++#             single-epilogue-in-header: 1
++#             exception-data: 1
++#             version: 0
++#             function-size: 2856
++# 0xe5        end_c
++# 0x01         .seh_stackalloc 16
++# 0xe4        end
++# 0xe3        nop
++# 0x00000000  seh-handler
++# 0x001ffff8  fragment-offset
++# 0x0000003c  seh-handle-data-address
++# 0x00000001  long 1 (seh_handlerdata)
++
++ 0000 ffff1308 01e4e3e3 00000000 00000000  .*
++ 0010 3c000000 ffff1308 e501e4e3 00000000  .*
++ 0020 fcff0f00 3c000000 ca021008 e501e4e3  .*
++ 0030 00000000 f8ff1f00 3c000000 01000000  .*
+\ No newline at end of file
+diff --git a/gas/testsuite/gas/pe/seh-aarch64-large-func.s b/gas/testsuite/gas/pe/seh-aarch64-large-func.s
+new file mode 100644
+index 00000000000..4e7d4772b65
+--- /dev/null
++++ b/gas/testsuite/gas/pe/seh-aarch64-large-func.s
+@@ -0,0 +1,13 @@
++	.text
++	.seh_proc	foo
++foo:
++	.seh_stackalloc 16
++	.seh_endprologue
++	.rept 2100000 / 4
++	nop
++	.endr
++	.seh_handler _ZN9exception6handleEPvS0_S0_S0_, @except
++	.seh_handlerdata
++	.long 1
++	.seh_code
++	.seh_endproc
+diff --git a/gas/testsuite/gas/pe/seh-aarch64.d b/gas/testsuite/gas/pe/seh-aarch64.d
+new file mode 100644
+index 00000000000..c980b8766df
+--- /dev/null
++++ b/gas/testsuite/gas/pe/seh-aarch64.d
+@@ -0,0 +1,69 @@
++#objdump: -s -j .xdata
++#name: PEP aarch64 SEH
++
++.*:     file format pe-aarch64-little
++
++Contents of section .xdata:
++
++# .xdata SEH record
++# 0x98500000  code-words: 19
++#             epilogue-count: 1
++#             single-epilogue-in-header: 0
++#             exception-data: 1
++#             version: 0
++#             function-size: 0
++# 0x00000000  start-index: 0
++#             epilog-start-offset: 0
++# 0xe6        .seh_save_next
++# 0xe1        .seh_set_fp
++# 0xfc        .seh_pac_sign_lr
++# 0xe3        .seh_nop
++# 0xe218      .seh_add_fp 192
++# 0x36        .seh_save_r19r20_x 176
++# 0x93        .seh_save_fplr_x 160
++# 0x52        .seh_save_fplr 144
++# 0xdeef      .seh_save_freg_x d15, 128
++# 0xde2f      .seh_save_freg_x d9, 128
++# 0xde0f      .seh_save_freg_x d8, 128
++# 0xddce      .seh_save_freg d15, 112
++# 0xdc4e      .seh_save_freg d9, 112
++# 0xdc0e      .seh_save_freg d8, 112
++# 0xdbcb      .seh_save_fregp_x d15, 96
++# 0xda4b      .seh_save_fregp_x d9, 96
++# 0xda0b      .seh_save_fregp_x d8, 96
++# 0xd9ca      .seh_save_fregp d15, 80
++# 0xd84a      .seh_save_fregp d9, 80
++# 0xd80a      .seh_save_fregp d8, 80
++# 0xd748      .seh_save_lrpair x29, 64
++# 0xd648      .seh_save_lrpair x21, 64
++# 0xd608      .seh_save_lrpair x19, 64
++# 0xce85      .seh_save_regp_x x29, 48
++# 0xcc45      .seh_save_regp_x x20, 48
++# 0xcc05      .seh_save_regp_x x19, 48
++# 0xca84      .seh_save_regp x29, 32
++# 0xc844      .seh_save_regp x20, 32
++# 0xc804      .seh_save_regp x19, 32
++# 0xd561      .seh_save_reg_x x30, 16
++# 0xd421      .seh_save_reg_x x20, 16
++# 0xd401      .seh_save_reg_x x19, 16
++# 0xd2c0      .seh_save_reg x30, 0
++# 0xd040      .seh_save_reg x20, 0
++# 0xd000      .seh_save_reg x19, 0
++# 0xe0ffffff  .seh_stackalloc 268435440
++# 0xe0000800  .seh_stackalloc 32768
++# 0xc020      .seh_stackalloc 512
++# 0x01        .seh_stackalloc 16
++# 0xe4        nop
++# 0xe4        nop
++# 0x00000000  seh-handler
++# 0x00000000  fragment-offset
++# 0x00000060  seh-handle-data-address
++# 0x00000001  long 1 (seh_handlerdata)
++
++ 0000 00005098 00000000 e6e1fce3 e2183693  .*
++ 0010 52deefde 2fde0fdd cedc4edc 0edbcbda  .*
++ 0020 4bda0bd9 cad84ad8 0ad748d6 48d608ce  .*
++ 0030 85cc45cc 05ca84c8 44c804d5 61d421d4  .*
++ 0040 01d2c0d0 40d000e0 ffffffe0 000800c0  .*
++ 0050 2001e4e4 00000000 00000000 60000000  .*
++ 0060 01000000 .*
+\ No newline at end of file
+diff --git a/gas/testsuite/gas/pe/seh-aarch64.s b/gas/testsuite/gas/pe/seh-aarch64.s
+new file mode 100644
+index 00000000000..5868a7f57dc
+--- /dev/null
++++ b/gas/testsuite/gas/pe/seh-aarch64.s
+@@ -0,0 +1,49 @@
++	.text
++	.seh_proc	foo
++	.seh_stackalloc 16
++	.seh_stackalloc 512
++	.seh_stackalloc 32768
++	.seh_stackalloc 268435440
++	.seh_save_reg x19, 0
++	.seh_save_reg x20, 0
++	.seh_save_reg x30, 0
++	.seh_save_reg_x x19, 16
++	.seh_save_reg_x x20, 16
++	.seh_save_reg_x x30, 16
++	.seh_save_regp x19, 32
++	.seh_save_regp x20, 32
++	.seh_save_regp x29, 32
++	.seh_save_regp_x x19, 48
++	.seh_save_regp_x x20, 48
++	.seh_save_regp_x x29, 48
++	.seh_save_lrpair x19, 64
++	.seh_save_lrpair x21, 64
++	.seh_save_lrpair x29, 64
++	.seh_save_fregp d8, 80
++	.seh_save_fregp d9, 80
++	.seh_save_fregp d15, 80
++	.seh_save_fregp_x d8, 96
++	.seh_save_fregp_x d9, 96
++	.seh_save_fregp_x d15, 96
++	.seh_save_freg d8, 112
++	.seh_save_freg d9, 112
++	.seh_save_freg d15, 112
++	.seh_save_freg_x d8, 128
++	.seh_save_freg_x d9, 128
++	.seh_save_freg_x d15, 128
++	.seh_save_fplr 144
++	.seh_save_fplr_x 160
++	.seh_save_r19r20_x 176
++	.seh_add_fp 192
++	.seh_nop
++	.seh_pac_sign_lr
++	.seh_set_fp
++	.seh_save_next
++	.seh_endprologue
++	.seh_handler _ZN9exception6handleEPvS0_S0_S0_, @except
++	.seh_handlerdata
++	.long 1
++	.seh_code
++	.seh_startepilogue
++	.seh_endepilogue
++	.seh_endproc
+diff --git a/gas/write.c b/gas/write.c
+index cd02d8c7fb8..4e898dd1021 100644
+--- a/gas/write.c
++++ b/gas/write.c
+@@ -1847,7 +1847,7 @@ set_symtab (void)
+ #endif
+ #endif
+ 
+-static void
++void
+ subsegs_finish_section (asection *s)
+ {
+   struct frchain *frchainP;
+diff --git a/gas/write.h b/gas/write.h
+index bc5260a2efd..69072cd57e2 100644
+--- a/gas/write.h
++++ b/gas/write.h
+@@ -191,5 +191,6 @@ extern void as_bad_subtract (fixS *);
+ struct segment_info_struct;
+ extern fragS *get_frag_for_address (fragS *, const struct segment_info_struct *,
+ 				    addressT);
++extern void subsegs_finish_section (asection *);
+ 
+ #endif /* __write_h__ */
+-- 
+2.51.0
+
