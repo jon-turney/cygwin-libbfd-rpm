@@ -1,18 +1,19 @@
 %{?cygwin_package_header}
 
+%define _make_verbose %{nil}
+
 Name:           cygwin-libbfd
-Version:        2.42
+Version:        2.47
 Release:        1%{?dist}
 Summary:        Cygwin BFD and opcodes libraries
 
 License:        GPLv2+ and LGPLv2+ and GPLv3+ and LGPLv3+
 Group:          Development/Libraries
-URL:            http://www.gnu.org/software/binutils/
+URL:            https://www.gnu.org/software/binutils/
 BuildArch:      noarch
 
-Source0:        https://ftpmirror.gnu.org/binutils/binutils-%{version}.tar.xz
+Source0:        https://ftp.gnu.org/gnu/binutils/binutils-%{version}.tar.xz
 Patch1:		binutils-2.42-cygwin-config-rpath.patch
-#Patch2:	binutils-2.42-cygwin-pep-dll-double-definition.patch
 
 BuildRequires:  gcc
 BuildRequires:  flex
@@ -30,6 +31,8 @@ BuildRequires:  cygwin64-gcc
 BuildRequires:  cygwin64
 BuildRequires:  cygwin64-gettext
 BuildRequires:  cygwin64-zlib
+
+%undefine cygwin_build_aarch64
 
 %description
 This package contains Cygwin cross-compiled BFD and opcodes static
@@ -74,7 +77,7 @@ unstable to be used dynamically.
   --disable-win32-registry \
   --disable-werror
 
-%cygwin_make %{?_smp_flags} all-libiberty all-opcodes all-bfd all-libctf
+%cygwin_make_build all-libiberty all-opcodes all-bfd all-libctf
 
 
 %install
@@ -132,6 +135,9 @@ find $RPM_BUILD_ROOT -name '*.la' -delete
 
 
 %changelog
+* Mon Sep 28 2026 Jon Turney <jon.turney@dronecode.org.uk> - 2.42-1
+- new version
+
 * Thu Aug 26 2021 Yaakov Selkowitz <yselkowi@redhat.com> - 2.37-1
 - new version
 
